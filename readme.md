@@ -7,3 +7,6 @@ Features: display characters on LCD, adjust brightness using, scrolling speed
 A simple digital theremin using Buzzer and photoresistors.
 The theremin uses the heterodyne principle to generate an audio signal. The instrument's pitch circuitry includes two radio frequency oscillators. One oscillator operates at a fixed frequency. The frequency of the other oscillator is controlled by the performer's distance from the pitch control antenna.
 http://www.youtube.com/watch?v=w5qf9O6c20o
+## IR.c
+Design and Implement a simple Infrared remote control that is compatible with the Deepcool RGB Colour LED Light Strip in the lab
+IR_FSM.png contains the FSM design
