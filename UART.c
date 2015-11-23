@@ -3,8 +3,8 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define BUFFER_SIZE 9 // 9 bytes in each buffer
-#define POOL_SIZE 8 // Pool has 8 buffers
+#define BUFFER_SIZE  10//8 bytes in each buffer
+#define POOL_SIZE 20 // Pool has 8 buffers
 #define PRESCALE 255UL; //Clock prescale value
 /* Define a buffer and buffer pool */
 typedef char buffer_t[BUFFER_SIZE]; // define buffer
@@ -21,13 +21,16 @@ void static NVIC_Init(void);//Initialize the NVIC
 
 /* Methods to deal with the buffer queue*/
 void queue_Init(queue_t* queue);//initialize the queue before using
+int is_queue_full(queue_t* queue);//indicate if the queue is full
+int is_queue_full(queue_t* queue);//indicate if the queue is empty
 buffer_t *get_buffer(queue_t* queue); // return a pointer to the buffer from the queue
-buffer_t *release_buffer(queue_t *queue);//release a buffer back to queue
+int release_buffer(queue_t *queue, buffer_t* out_buffer);//release a buffer back to queue
 
 /* Methods to deal with the UART */
-void Tx_message(buffer_t *msg_buffer);//will accept the msg for Tx'ing
-buffer_t *Rx_message(void);//return a pointer to an Rx msg
-
+void Tx_message(char *msg_buffer, uint32_t msg_size);//will accept the msg for Tx'ing
+void Rx_message(buffer_t *buffer);//return a pointer to an Rx msg
+void start_UART();// Kick-start the UART TX at the beginning
+	
 /* Methods to deal with the Timer */
 void start_timer(void);
 
@@ -43,9 +46,11 @@ void continue_Clock(void);//continue the clock
 
 /* Misc */
 void static stop_execution(void);//stop execution right away
+void UART_OutChar(unsigned char data);
 /* ------------ GLOBAL Variables ------------- */
 queue_t tx_queue, rx_queue; // define a tx_queue, rx_queue
 uint8_t hours, mins, secs; //hold the clock variables
+uint8_t busy_input = 0; //indicate if user is inputting
 /* ------------ queue_init() ------------------
 ** Initialize the message queue
 **
@@ -55,7 +60,27 @@ void queue_Init(queue_t* queue)
 	queue -> head  = 0;
 	queue -> tail  = 0;
 }
-/* ------------ get_buffer() -----------------
+/* ------------ is_queue_full() -----------------
+** Indicate if the queue is full
+** Return 1 if full, 0 otherwise
+*/
+int is_queue_full(queue_t* queue)
+{
+	if ((queue -> tail + 1)%POOL_SIZE == queue -> head)
+		return 1;
+	return 0;
+}
+/* ------------ is_queue_empty() -----------------
+** Indicate if the queue is empty
+** Return 1 if empty, 0 otherwise
+*/
+int is_queue_empty(queue_t* queue)
+{
+	if (queue -> tail == queue -> head)
+		return 1;
+	return 0;
+}
+/* ------------ get_buffer() --------------------
 ** This method return an available buffer from the queue
 ** Input: pointer to the queue
 ** Output: Pointer to a buffer allocated from the queue
@@ -64,7 +89,7 @@ void queue_Init(queue_t* queue)
 buffer_t *get_buffer(queue_t* queue)
 {
 	buffer_t* buff;
-	if ((queue -> tail + 1) != queue -> head) //if queue is not full yet
+	if (!is_queue_full(queue)) //if queue is not full yet
 	{
 		buff = &(queue->pool[queue->tail]);
 		queue->tail = (queue->tail + 1)%POOL_SIZE;
@@ -79,35 +104,50 @@ buffer_t *get_buffer(queue_t* queue)
 /* ------------ release_buffer() -------------------
 ** This method release a buffer back to the queue
 ** Input: pointer to the queue
-** Output: return the pointer to the released buffer
+** Output: Return 1 on success, 0 on failure
 **
 */
-buffer_t *release_buffer(queue_t *queue)
+int release_buffer(queue_t *queue, buffer_t* out_buffer)
 {
 	buffer_t *buffer= NULL;
-	if (queue -> tail != queue ->head) //if queue is not empty (just in case)
+	if (!is_queue_empty(queue)) //if queue is not empty (just in case)
 	{
 		buffer = &(queue -> pool[queue ->head]);
 		queue ->head  = (queue ->head  + 1)%POOL_SIZE;
+		memcpy(out_buffer,buffer,BUFFER_SIZE);
+		//Clean the buffer
+		memset(buffer,0x00,BUFFER_SIZE);
+		return 1;
 	}
-	return buffer;
+	return 0;
 }
 /* ------------ Tx_message -------------------------
 ** Transmit the msg_buffer by putting it to tx_queue
 **
-** Input: pointer to msg_buffer
+** If the msg_buffer is higher than BUFFER_SIZE
+** The msg_buffer will be truncated and put into several 
+** ... buffers
+** Input: pointer to msg_buffer, size of msg buffer
 ** Output: None
 */
-void Tx_message(buffer_t *msg_buffer)
+void Tx_message(char *msg_buffer, uint32_t msg_size)
 {
 	buffer_t *buff;
-	__set_PRIMASK(1);//disable all interrupts
-	buff = get_buffer(&tx_queue); //get a buffer from the tx_queue
-	__set_PRIMASK(0);//enable intterrupts
-	//copy msg to the buffer
-	memcpy(buff, msg_buffer, sizeof(*buff));
-	//Unmask Tx interrupt at UART
-	UART0 -> IM |= (UART_IM_TXIM);
+	uint32_t i=0;
+	uint8_t n;
+	while (i<msg_size)
+	{
+		__set_PRIMASK(1);//disable all interrupts
+		buff = get_buffer(&tx_queue); //get a buffer from the tx_queue
+		__set_PRIMASK(0);//enable intterrupts
+		//copy msg to the buffer
+		n = (msg_size-i>BUFFER_SIZE)?(BUFFER_SIZE-1):msg_size-i;
+		strncpy((char*)buff,&msg_buffer[i],n);//truncate the msg_buffer
+		(*buff)[n+1]='\0';
+		i += n;
+		//Unmask Tx interrupt at UART
+		UART0 -> IM |= (UART_IM_TXIM);
+	}
 }
 /* ------------ Rx_message --------------------
 ** Return a buffer from the rx_queue
@@ -115,14 +155,11 @@ void Tx_message(buffer_t *msg_buffer)
 ** Input: None
 ** Output: pointer to buffer containing msg
 */
-buffer_t * Rx_message()
+void Rx_message(buffer_t *buffer)
 {
-	int i;
-	buffer_t * buff;
 	__set_PRIMASK(1);//disable all interrupts
-	buff = release_buffer(&rx_queue); //release a buffer from the rx_queue
+	release_buffer(&rx_queue,buffer); //release a buffer from the rx_queue
 	__set_PRIMASK(0);//enable intterrupts
-	return buff;
 }
 /* ------------ UART_Init ---------------------
 ** Initialize the UART for 115,200 baud rate (assuming 16 MHz UART clock),
@@ -133,22 +170,34 @@ buffer_t * Rx_message()
 void UART_Init(void){
   SYSCTL -> RCGCUART |= SYSCTL_RCGCUART_R0; // activate UART0
   SYSCTL -> RCGCGPIO |= SYSCTL_RCGCGPIO_R0; // activate port A
-  UART0 -> CTL &= ~UART_CTL_UARTEN;        // disable UART
-	UART0 -> CTL &= ~UART_CTL_EOT; // TXRIS bit set when FIFO condition met
+  UART0 -> CTL &= ~UART_CTL_UARTEN;        // disable UART 
+	//UART0 -> CTL |= UART_CTL_EOT; //End of Tranmision
   UART0 -> IBRD = 8;                       // IBRD = int(16,000,000 / (16 * 115,200)) = int(8.680555) = 8
   UART0 ->FBRD  = 44;                      // FBRD = int(0.680555 * 64 + 0.5) = 44
                                            // 8 bit word length (no parity bits, one stop bit, enable FIFOs)
-  UART0 -> LCRH = (UART_LCRH_WLEN_8|UART_LCRH_FEN);
+  UART0 -> LCRH |= (UART_LCRH_WLEN_8|UART_LCRH_FEN);
   GPIOA -> AMSEL &= ~0x03;                // disable analog functionality on PA
   GPIOA -> AFSEL |= 0x03;                 // enable alt funct on PA1-0
   GPIOA -> DEN |= 0x03;                    // enable digital I/O on PA1-0
                                            // configure PA1-0 as UART   (just in case)
   GPIOA -> PCTL = (GPIOA -> PCTL & 0xFFFFFF00)+0x00000011;
-	UART0 -> ICR = (TIMER_ICR_TATOCINT | TIMER_ICR_TBTOCINT); // clear time-out interrupt
-	UART0 -> IM |= (UART_IM_RTIM) ; //arm interrupt for RX
+	UART0 -> ICR |= (UART_ICR_TXIC | UART_ICR_RTIC); // clear interrupt
+	UART0 -> IM |= (UART_IM_RTIM|UART_IM_TXIM) ; //arm interrupt for RX and TX
 	UART0 -> CTL |= UART_CTL_UARTEN;         // enable UART
 }
 
+/* ------------- Start UART ---------------------
+** The UART TX need to be kick-start by filling 
+** ... up the FIFO
+**
+ */
+void start_UART()
+{
+  char s[]="00:00:00\r\n";
+	int i;
+	for (i=0;i<sizeof(s);i++)
+		UART0->DR = s[i];
+}
 /* ------------ NVIC_Init -----------
 ** Initialize the NVIC 
 ** Register the interrupt from the UART0 TX and UART0 RX
@@ -179,6 +228,11 @@ void NVIC_Init(void)
 	NVIC -> ICPR[0] = 1UL<<5;
 	//Enable interrupt for UART0 at NVIC
 	NVIC -> ISER[0] = 1UL<<5;
+	/* Push Button */
+	/* Init for PF4 (SW1) and PF0 (SW2) */
+	NVIC->IP[30] = (4 << 5);	//IRQ#30 for GPIOF, see ds pg104
+	NVIC->ICPR[0] = (1UL << 30);	//Clear pending bit to be safe
+	NVIC->ISER[0] = (1UL << 30);	//Enable interrup at NVIC
 }
 /* ------------- GPIO_Init --------------------
 ** Initialize the GPIO used in this lab
@@ -195,6 +249,17 @@ void GPIO_Init(void)
   // Enable the GPIO pin for the LED (PF3).
 	GPIOF->DIR |= 0x08;       // Set the direction as output
   GPIOF->DEN |= 0x08;       // Enable the GPIO pin for digital function
+	// Init the Push Button
+	/* Setting up PF4 (SW1) */
+	GPIOF->DIR &= ~(1UL << 4);	// Set PF4 as input
+	GPIOF->DEN |= (1UL << 4);		// Digital enable PF4
+	GPIOF->IM &= ~(1UL << 4);		// Mask PF4 for now while configuring
+	GPIOF->IS &= ~(1UL << 4);		// PF4 Edge sensitive
+	GPIOF->IBE &= ~(1UL << 4);	// Interrupt generation controlled by IEV
+	GPIOF->IEV |= (1UL << 4);		// Interrupt generated on rising edge
+	GPIOF->PUR |= (1UL << 4); 	// Weak pull up resistor for PF4
+	GPIOF->ICR |= (1UL << 4);		// Clear PF4 Interrupt
+	GPIOF->IM |= (1UL << 4);		// Enable Interrupts for PF4
 }
 /* ------------- Timer_Init() -------------------
 ** Initialize the Timer used in this lab
@@ -212,7 +277,7 @@ void Timer_Init(void)
 	TIMER0->CTL &= ~(TIMER_CTL_TBEN); // disable TIMER0B while configuring
 	TIMER0->TBMR = 0x2UL; // TIMER0B count-down, periodic
 	TIMER0->TBPR = PRESCALE; // set CLK prescale value
-	TIMER0->ICR = 1UL; // clear time-out interrupt
+	TIMER0->ICR |= (TIMER_ICR_TATOCINT | TIMER_ICR_TBTOCINT); // clear time-out interrupt
 	TIMER0->CTL |= (1UL << 9); // TBSTALL
 }
 /* ------------- start_timer() ------------------------
@@ -256,15 +321,15 @@ void slower_Clock()
 */
 void set_Clock(char *val)
 {
-	buffer_t *buff;
+	char buff[10];
 	char sub[2];
 	strncpy(sub,&val[1],2);//extract the HH
 	hours = atoi(sub);
 	strncpy(sub,&val[4],2);//extract the MM
 	mins = atoi(sub);
 	secs = 0;
-	Create_Clock_Display((char*)buff);//generate clock HH:MM:SS
-	Tx_message(buff);//transmit the buffer
+	Create_Clock_Display(buff);//generate clock HH:MM:SS
+	Tx_message(buff,sizeof(buff));//transmit the buffer
 }
 /* ------------- pause_Clock() -----------------------
 ** Pause the Clock
@@ -272,7 +337,7 @@ void set_Clock(char *val)
 */
 void pause_Clock()
 {
-	//To Do
+	TIMER0->CTL &= ~(TIMER_CTL_TAEN); //disable TIMER0A
 }
 /* ------------- continue_Clock() -----------------------
 ** continue the Clock
@@ -280,7 +345,7 @@ void pause_Clock()
 */
 void continue_Clock()
 {
-	//To Do
+	TIMER0->CTL |= (TIMER_CTL_TAEN); //enable TIMER0A
 }
 /* ------------- Create_Clock_Display-----------
 ** Create a string representation of the clock
@@ -289,7 +354,7 @@ void continue_Clock()
 */
 void Create_Clock_Display(char *clock_display)
 {
-	sprintf(clock_display, "%02d:%02d:%02d\r",hours,mins,secs);
+	sprintf(clock_display, "%02d:%02d:%02d\r\n",hours,mins,secs);
 }
 /* ------------- Increase_Clock ----------------
 ** Increase the clock by 1 sec
@@ -319,14 +384,17 @@ void Increase_Clock()
 */
 void TIMER0A_Handler(void)
 {
-	buffer_t * buff;
+	char buff[10];
 	//clear interrupt at GPTM
 	TIMER0->ICR = TIMER_ICR_TATOCINT;
 	//clear pending bit in NVIC
 	NVIC->ICPR[0] = 1UL<<19;
 	Increase_Clock();//Increase the Clock
-	Create_Clock_Display((char*)buff);//generate clock HH:MM:SS
-	Tx_message(buff);//transmit the buffer
+	if (!busy_input) // if the user is inputting, dont generate Tx data
+	{
+		Create_Clock_Display(buff);//generate clock HH:MM:SS
+		Tx_message(buff, sizeof(buff));//transmit the buffer
+	}
 }
 /* ------------- Timer0B_Handler ---------------
 ** Handles the interrupt from timer0B
@@ -334,16 +402,16 @@ void TIMER0A_Handler(void)
 */
 void TIMER0B_Handler(void)
 {
-	buffer_t * buff;
+	buffer_t buff;
 	char c;
 	//clear interrupt at GPTM
 	TIMER0->ICR = TIMER_ICR_TBTOCINT;
 	//clear pending bit in NVIC
 	NVIC->ICPR[0] = 1UL<<20;
 	//read buffer from the rx_queue
-	buff = Rx_message();
+	Rx_message(&buff);
 	//Compare actions
-	c = ((char*)buff)[0];
+	c = buff[0];
 	switch (c)
 	{
 		case 'T':
@@ -371,23 +439,23 @@ void TIMER0B_Handler(void)
 void UART0_Handler(void)
 {
 	char byte;
-	int i;
+	int i,ret;
 	static buffer_t rx_temp_buff;
 	static uint8_t buff_count = 0;
-	buffer_t *buff;
+	buffer_t *rx_buff;
 	buffer_t tx_buff;
 	/* TX ISR */
 	if ((UART0 -> RIS & UART_RIS_TXRIS) != 0)
 	{
 		//Empty buffer from the Tx queue
 		__set_PRIMASK(1); //Disable all interrupts
-		buff = release_buffer(&tx_queue);//get a released buff from tx_queue
+		ret = release_buffer(&tx_queue,&tx_buff);//get a released buff from tx_queue
 		__set_PRIMASK(0); //Enable all interrupts
-		if (buff != NULL)
+		if (ret)
 		{
 			for (i=0; i<BUFFER_SIZE; i++)
 			{
-				UART0 -> DR = *buff[i];
+				UART0 -> DR = tx_buff[i];
 			}
 		}
 		else //if no more data to send
@@ -400,21 +468,26 @@ void UART0_Handler(void)
 	if ((UART0 -> RIS & UART_RIS_RTRIS) != 0)
 	{
 		UART0 -> ICR |= UART_ICR_RTIC;//clear interrupt
+		busy_input = 1; //indicating that user is inputting
 		//transfer data from FIFO to the buffer
 		do{
 			byte = (unsigned char)(UART0 -> DR & 0xFF);
 		  rx_temp_buff[buff_count] = byte;
 			buff_count++;
-			if (byte == 0x0d) buff_count = BUFFER_SIZE; //if byte is carry return
+			if (byte == 0x0d)  //if byte is carry return
+			{
+				buff_count = BUFFER_SIZE;
+				busy_input = 0; //user finished inputting
+			}
 		}while((UART0 -> FR & UART_FR_RXFE)==0 && buff_count<BUFFER_SIZE);
 		if (buff_count>=BUFFER_SIZE)// if the temp buffer is full
 		{
 			//Fill the Rx queue with the temp buffer
 			__set_PRIMASK(1); //Disable all interrupts
-			buff = get_buffer(&rx_queue); //get a buffer from the rx_queue
+			rx_buff = get_buffer(&rx_queue); //get a buffer from the rx_queue
 			__set_PRIMASK(0); //Enable all interrupts
 			//copy the temp_buff to the buff
-			memcpy(buff, &rx_temp_buff, sizeof(*buff));
+			memcpy(rx_buff, &rx_temp_buff, sizeof(*rx_buff));
 			//reset the temp_buff
 			buff_count = 0;
 		}
@@ -424,7 +497,21 @@ void UART0_Handler(void)
 		{
 			tx_buff[i]=0x00;
 		}
-		Tx_message(&tx_buff);
+		Tx_message(tx_buff, sizeof(tx_buff));
+	}
+}
+/* ----------- GPIOF_Handler ---------------
+** Handle the push button pressed
+**
+**/
+void GPIOF_Handler(void)
+{
+	
+	// If Interrupt caused by PF4
+	if(GPIOF->RIS & (1UL << 4))
+	{
+		GPIOF->ICR |= (1UL << 4);	// Clear Interrupt
+		Tx_message("Button Pressed\r\n", sizeof("Button Pressed\r\n"));
 	}
 }
 /* -------------- Stop execution -------------
@@ -448,10 +535,10 @@ int main(void)
 	// Initialize the tx_queue and rx_queue
 	queue_Init(&tx_queue);	
 	queue_Init(&rx_queue);
-	// Initialze the clock
-	set_Clock("T00:00");
 	// Initialize the Timer
 	Timer_Init();
+	// Start the UART
+	start_UART();
 	// Start the timer
 	start_timer();
 	while(1);
